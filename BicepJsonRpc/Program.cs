@@ -1,6 +1,7 @@
 ﻿using System.IO.Pipes;
 using System.CommandLine;
 using System.CommandLine.Binding;
+using System.Diagnostics;
 using BicepJsonRpc;
 using Microsoft.Extensions.Logging;
 using StreamJsonRpc;
@@ -32,6 +33,12 @@ var searchRecursivelyOption = new Option<bool>(name: "--searchRecursively",
 searchRecursivelyOption.AddAlias("-rs");
 searchRecursivelyOption.IsRequired = false;
 
+var bicepExecutablePathOption = new Option<string>(name: "--bicepExecutablePath",
+    description: "The path to the bicep executable")
+{
+    IsRequired = false
+};
+
 var verbosityOption = new Option<VerbosityLevel>(name: "--verbosity",
     description: "The verbosity level of the logger. Informational bicep diagnostics will be logged to the trace.")
     {
@@ -45,24 +52,25 @@ var rootCommand = new RootCommand
     pipeNameOption,
     shouldExtractInSameFolderOption,
     searchRecursivelyOption,
-    verbosityOption
+    verbosityOption,
+    bicepExecutablePathOption
 };
 
 rootCommand.Description = "A tool to compile bicep files into JSON ARM templates";
 
 rootCommand.SetHandler(async (bicepCompilationOutputPathValue, bicepModuleRootPathValue, 
-    pipeNameValue, shouldExtractInSameFolderValue, searchRecursivelyValue, logger) =>
+    pipeNameValue, shouldExtractInSameFolderValue, searchRecursivelyValue, bicepExecutablePathValue,logger) =>
 {
     await RunAsync(bicepModuleRootPathValue, bicepCompilationOutputPathValue, logger, pipeNameValue, 
-        shouldExtractInSameFolderValue, searchRecursivelyValue);
+        shouldExtractInSameFolderValue, searchRecursivelyValue, bicepExecutablePathValue);
     
 }, bicepCompilationOutputPathOption, bicepModuleRootPathOption, pipeNameOption, 
-    shouldExtractInSameFolderOption, searchRecursivelyOption, new MyCustomBinder(verbosityOption));
+    shouldExtractInSameFolderOption, searchRecursivelyOption, bicepExecutablePathOption,new MyCustomBinder(verbosityOption));
 
 return await rootCommand.InvokeAsync(args);
 
 static async Task<int> RunAsync(string rootPath, string outputPath, ILogger logger, string? pipeName = null, bool? sameFolderExtraction = null,
-    bool? recursiveSearch = null)
+    bool? recursiveSearch = null, string? bicepExecutablePath = null)
 {
     pipeName = pipeName ?? Guid.NewGuid().ToString();
     await using var pipeStream = new NamedPipeServerStream(pipeName, PipeDirection.InOut, 
@@ -76,9 +84,25 @@ static async Task<int> RunAsync(string rootPath, string outputPath, ILogger logg
     {
         logger.LogWarning("Starting to listen on the pipe {0} until {1}", pipeName,
             DateTime.Now.AddMinutes(timeout.TotalMinutes));
-        await pipeStream.WaitForConnectionAsync(cts.Token);
+        
+        var tasks = new List<Task>();
+        if (bicepExecutablePath is not null)
+        {
+            tasks.Add(Task.Run(async () =>
+            {
+                var rpcProcess = new Process();
+                rpcProcess.StartInfo.FileName = bicepExecutablePath;
+                rpcProcess.StartInfo.Arguments = $"jsonrpc --pipe {pipeName}";
+                rpcProcess.Start();
+            }));
+        }
+        
+        tasks.Add(pipeStream.WaitForConnectionAsync(cts.Token));
+        
+        await Task.WhenAll(tasks);
         logger.LogInformation("A client connected to the pipe {0}", pipeName);
         var client = JsonRpc.Attach<ICliJsonRpcProtocol>(CliJsonRpcServer.CreateMessageHandler(pipeStream, pipeStream));
+
         await DecompileBicepFilesAsync(rootPath, outputPath, logger, client, sameFolderExtraction, recursiveSearch);
     }
     catch (Exception ex)
